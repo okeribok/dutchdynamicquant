@@ -28,12 +28,12 @@ import numpy as np
 # ================================================================
 
 # TARGET MODEL
-HF_MODEL_ID       = "ibm-granite/granite-4.0-h-tiny"
-HF_FP16_GGUF_REPO = "ibm-granite/granite-4.0-h-tiny-GGUF"
-HF_FP16_GGUF_FILE = "granite-4.0-h-tiny-f16.gguf"
+HF_MODEL_ID       = "ibm-granite/granite-4.0-h-micro"
+HF_FP16_GGUF_REPO = "ibm-granite/granite-4.0-h-micro-GGUF"
+HF_FP16_GGUF_FILE = "granite-4.0-h-micro-f16.gguf"
 
 # REFERENCE MODEL (for Unsloth dynamic maps)
-HF_UNSLOTH_REPO   = "unsloth/granite-4.0-h-tiny-GGUF"
+HF_UNSLOTH_REPO   = "unsloth/granite-4.0-h-micro-GGUF"
 
 # ----------------------------------------------------------------
 # CHANGE ONLY THIS
@@ -128,20 +128,7 @@ def stop_server(proc):
         proc.terminate()
         proc.wait()
 
-def get_probs(prompt, port=8080):
-    """Fetches probabilities, supporting multiple llama-server API versions."""
-    data = json.dumps({"prompt": prompt, "n_predict": 0, "n_probs": TOP_K}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/completion", data=data, headers={'Content-Type': 'application/json'})
-    try:
-        with urllib.request.urlopen(req) as r:
-            res = json.loads(r.read().decode())
-            if "completion_probabilities" in res:
-                return res["completion_probabilities"][0].get("probs", [])
-            if "choices" in res:
-                return res["choices"][0].get("logprobs", {}).get("top_logprobs", [])
-            return []
-    except:
-        return []
+
 
 # ================================================================
 # MAIN PIPELINE
@@ -238,53 +225,123 @@ if not SKIP_PPL:
         with open(PPL_RESULTS_JSON, "w") as f: json.dump(all_ppl, f, indent=2)
 
 # [D] KL-Divergence (KLD)
+# ----------------------------------------------------------------
+# Response format (confirmed by diagnostic):
+#   res["completion_probabilities"][0]["top_logprobs"]
+#   each entry: {"id": int, "token": str, "bytes": [...], "logprob": float}
+#
+# Sequential design: FP16 probs cached to disk first, then each
+# quant model runs solo — avoids OOM on large models.
+# ----------------------------------------------------------------
 if not SKIP_KLD:
     print(f"\n{'='*70}\nPhase D: KL-Divergence\n{'='*70}")
-    if RESET_KLD and KLD_RESULTS_JSON.exists(): KLD_RESULTS_JSON.unlink()
+    if RESET_KLD:
+        if KLD_RESULTS_JSON.exists(): KLD_RESULTS_JSON.unlink()
+        fp16_cache_dir = RESULTS_DIR / "kld_fp16_cache"
+        if fp16_cache_dir.exists(): shutil.rmtree(fp16_cache_dir)
     all_kld = json.load(open(KLD_RESULTS_JSON)) if KLD_RESULTS_JSON.exists() else {}
 
+    def get_logprobs(prompt, port=8080):
+        """Returns dict of {token_str: logprob} for the top-K next tokens."""
+        data = json.dumps({"prompt": prompt, "n_predict": 1, "n_probs": TOP_K}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/completion", data=data,
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read().decode())
+            entries = res["completion_probabilities"][0]["top_logprobs"]
+            return {e["token"]: e["logprob"] for e in entries}
+        except Exception as e:
+            return {}
+
+    # --- Step D1: Cache FP16 logprobs for all clusters (once) ---
+    fp16_cache_dir = RESULTS_DIR / "kld_fp16_cache"
+    fp16_cache_dir.mkdir(exist_ok=True)
+
+    clusters_needing_cache = []
+    for cluster_file in sorted(TEXTS_DIR.glob("cluster_*.txt")):
+        cid = cluster_file.stem.split("_")[1]
+        if not (fp16_cache_dir / f"cluster_{cid}.json").exists():
+            clusters_needing_cache.append((cid, cluster_file))
+
+    if clusters_needing_cache:
+        print(f"  Caching FP16 logprobs for {len(clusters_needing_cache)} clusters...")
+        srv_fp16 = start_server(FP16_GGUF, 8080)
+        if not srv_fp16:
+            print("  [!] FP16 server startup failed — skipping KLD phase.")
+        else:
+            time.sleep(3)
+            for cid, cluster_file in clusters_needing_cache:
+                prompts = [p.strip() for p in cluster_file.read_text(encoding="utf-8").split("\n\n") if p.strip()][:KLD_SAMPLES]
+                cached = [get_logprobs(p, 8080) for p in prompts]
+                n_ok = sum(1 for c in cached if c)
+                with open(fp16_cache_dir / f"cluster_{cid}.json", "w") as f:
+                    json.dump(cached, f)
+                print(f"    Cached cluster {cid} ({n_ok}/{len(prompts)} prompts ok)")
+            stop_server(srv_fp16)
+            print("  FP16 cache complete.\n")
+    else:
+        print("  FP16 logprobs: all clusters cached.\n")
+
+    # --- Step D2: Compare each quant model against FP16 cache ---
     for m_key, m_path in [("q_nl", Q_NL_GGUF), ("q_plain", Q_PLAIN_GGUF)]:
         if m_key not in all_kld: all_kld[m_key] = {}
         print(f"  Testing {m_key} vs FP16...")
 
-        srv_fp16 = start_server(FP16_GGUF, 8080)
-        if not srv_fp16:
-            print("  [!] FP16 server startup failed."); continue
-        srv_q = start_server(m_path, 8081)
+        srv_q = start_server(m_path, 8080)
         if not srv_q:
-            print("  [!] Quant server startup failed."); stop_server(srv_fp16); continue
+            print(f"  [!] {m_key} server startup failed."); continue
         time.sleep(3)
 
         for cluster_file in sorted(TEXTS_DIR.glob("cluster_*.txt")):
             cid = cluster_file.stem.split("_")[1]
             if cid in all_kld[m_key]: continue
 
-            prompts = [p.strip() for p in cluster_file.read_text(encoding='utf-8').split("\n\n") if p.strip()][:KLD_SAMPLES]
+            cache_file = fp16_cache_dir / f"cluster_{cid}.json"
+            if not cache_file.exists():
+                print(f"    Cluster {cid}: no FP16 cache, skipping"); continue
+
+            fp16_cache = json.load(open(cache_file))
+            prompts = [p.strip() for p in cluster_file.read_text(encoding="utf-8").split("\n\n") if p.strip()][:KLD_SAMPLES]
+
             kls, flips = [], 0
+            for p, fp16_logp in zip(prompts, fp16_cache):
+                if not fp16_logp: continue
+                q_logp = get_logprobs(p, 8080)
+                if not q_logp: continue
 
-            for p in prompts:
-                def clean_probs(p_list):
-                    return {i.get("tok_str", i.get("token")): i.get("prob", i.get("p", 0)) for i in p_list}
+                # Floor: use the lowest logprob in the quant top-K minus a margin
+                floor_lp = min(q_logp.values()) - math.log(100.0)
 
-                p_f16 = clean_probs(get_probs(p, 8080))
-                p_q   = clean_probs(get_probs(p, 8081))
-                if not p_f16 or not p_q: continue
+                kl = 0.0
+                for tok, lp_fp16 in fp16_logp.items():
+                    p_fp16 = math.exp(lp_fp16)
+                    lp_q = q_logp.get(tok, floor_lp)
+                    kl += p_fp16 * (lp_fp16 - lp_q)
 
-                kl = 0
-                for t, prob_a in p_f16.items():
-                    prob_b = p_q.get(t, 1e-7)
-                    kl += prob_a * math.log(prob_a / prob_b)
-                kls.append(kl)
-                if list(p_f16.keys())[0] != list(p_q.keys())[0]: flips += 1
+                if math.isfinite(kl) and kl >= 0.0:
+                    kls.append(kl)
+                    best_fp16 = max(fp16_logp, key=fp16_logp.get)
+                    best_q    = max(q_logp,    key=q_logp.get)
+                    if best_fp16 != best_q: flips += 1
 
             if kls:
-                res = {"mean": float(np.mean(kls)), "median": float(np.median(kls)), "p99": float(np.percentile(kls, 99)), "flip_rate": flips/len(kls), "n": len(kls)}
+                res = {
+                    "mean":      float(np.mean(kls)),
+                    "median":    float(np.median(kls)),
+                    "p99":       float(np.percentile(kls, 99)),
+                    "flip_rate": flips / len(kls),
+                    "n":         len(kls),
+                }
                 all_kld[m_key][cid] = res
-                print(f"    Cluster {cid}: KL={res['mean']:.5f} Flip={res['flip_rate']:.2%}")
+                print(f"    Cluster {cid}: KL={res['mean']:.5f}  flip={res['flip_rate']:.2%}")
                 with open(KLD_RESULTS_JSON, "w") as f:
                     json.dump(all_kld, f, indent=2)
+            else:
+                print(f"    Cluster {cid}: no valid prompts")
 
-        stop_server(srv_fp16); stop_server(srv_q)
+        stop_server(srv_q)
 
     # FINAL SUMMARY
     print(f"\n{'='*70}\nKLD SUMMARY — KL(FP16 || quant)\n{'='*70}")
@@ -296,5 +353,4 @@ if not SKIP_KLD:
         wm = sum(i["mean"] * i["n"] for i in v) / tn
         wf = sum(i["flip_rate"] * i["n"] for i in v) / tn
         print(f"{m:<16} {wm:>10.5f} {np.median([i['median'] for i in v]):>10.5f} {wf:>8.2%} {len(v):>5}")
-
 print("\nPipeline Finished.")
