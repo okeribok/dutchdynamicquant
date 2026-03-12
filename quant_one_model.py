@@ -7,6 +7,10 @@ Phase C: Perplexity (PPL) per cluster vs FP16 baseline
 Phase D: KL-Divergence (KLD) per cluster via llama-server logprobs
 
 All phases fully resumable. Use SKIP_* / RESET_* flags in CONFIG.
+
+Dependencies:
+  Always required:  pip install huggingface_hub numpy gguf
+  Full reprocess:   pip install datasets pyarrow   (only if USE_PREBUILT_TEXTS = False)
 """
 
 import json
@@ -51,6 +55,13 @@ RESET_QUANT = False
 # KLD Settings
 TOP_K       = 100
 KLD_SAMPLES = 100
+
+# Data sourcing
+# True  (default): download pre-built cluster_texts/ and dutch_calibration.txt
+#                  from the dataset repo (~2.5 MB, no parquet, no datasets/pyarrow)
+# False           : download and reprocess the full parquet (~8.5 GB)
+#                  use this if you want to rebuild from scratch or alter sampling
+USE_PREBUILT_TEXTS = True
 # ----------------------------------------------------------------
 
 # Derived values
@@ -161,22 +172,62 @@ if not OVERRIDES_TXT.exists() or OVERRIDES_TXT.stat().st_size == 0:
             f.write(f"{tensor.name}={tensor.tensor_type.name}\n")
     print(f"  [OK] Extracted {len(reader.tensors)} tensors.")
 
-# [A3] Dataset Sampling
+# [A3] Dataset Sampling / Pre-built text download
 if not CALIB_TEXT_FILE.exists() or not any(TEXTS_DIR.iterdir()):
-    print(f"[A3] Preparing Dutch data...")
-    from datasets import load_dataset
-    ds = load_dataset(HF_DATASET_ID, split="train")
-    valid_ds = ds.filter(lambda x: x['ppl_fp16'] is not None)
-    
-    with open(CALIB_TEXT_FILE, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(valid_ds['text'][:2500]))
-    
-    for cid in range(N_CLUSTERS):
-        c_ds = valid_ds.filter(lambda x: x['cluster_id'] == cid)
-        if len(c_ds) > 0:
-            with open(TEXTS_DIR / f"cluster_{cid:03d}.txt", "w", encoding="utf-8") as f:
-                f.write("\n\n".join(c_ds['text'][:PPL_SAMPLE]))
-    print("  [OK] Data prepared.")
+    if USE_PREBUILT_TEXTS:
+        # Fast path: download pre-built cluster texts directly (~2.5 MB)
+        # Requires only huggingface_hub (already imported above).
+        # No datasets/pyarrow needed.
+        print(f"[A3] Downloading pre-built cluster texts from {HF_DATASET_ID}...")
+        from huggingface_hub import hf_hub_download
+
+        # dutch_calibration.txt
+        if not CALIB_TEXT_FILE.exists():
+            path = hf_hub_download(
+                repo_id=HF_DATASET_ID,
+                filename="dutch_calibration.txt",
+                repo_type="dataset",
+            )
+            shutil.copy(path, CALIB_TEXT_FILE)
+            print(f"  [OK] dutch_calibration.txt -> {CALIB_TEXT_FILE}")
+
+        # cluster_texts/cluster_000.txt … cluster_069.txt
+        n_downloaded = 0
+        for cid in range(N_CLUSTERS):
+            fname = f"cluster_texts/cluster_{cid:03d}.txt"
+            dest  = TEXTS_DIR / f"cluster_{cid:03d}.txt"
+            if dest.exists():
+                continue
+            try:
+                path = hf_hub_download(
+                    repo_id=HF_DATASET_ID,
+                    filename=fname,
+                    repo_type="dataset",
+                )
+                shutil.copy(path, dest)
+                n_downloaded += 1
+            except Exception as e:
+                print(f"  [!] Could not download {fname}: {e}")
+        print(f"  [OK] {n_downloaded} cluster files downloaded -> {TEXTS_DIR}")
+
+    else:
+        # Full reprocessing path: download and filter the full parquet (~8.5 GB).
+        # Requires: pip install datasets pyarrow
+        # Use this if you want to alter N_CLUSTERS, PPL_SAMPLE, or the filter logic.
+        print(f"[A3] Reprocessing full dataset from {HF_DATASET_ID}...")
+        from datasets import load_dataset
+        ds = load_dataset(HF_DATASET_ID, split="train")
+        valid_ds = ds.filter(lambda x: x['ppl_fp16'] is not None)
+
+        with open(CALIB_TEXT_FILE, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(valid_ds['text'][:2500]))
+
+        for cid in range(N_CLUSTERS):
+            c_ds = valid_ds.filter(lambda x: x['cluster_id'] == cid)
+            if len(c_ds) > 0:
+                with open(TEXTS_DIR / f"cluster_{cid:03d}.txt", "w", encoding="utf-8") as f:
+                    f.write("\n\n".join(c_ds['text'][:PPL_SAMPLE]))
+        print("  [OK] Data prepared.")
 
 # [B] Quantization
 print(f"\nPhase B: Building GGUFs")
